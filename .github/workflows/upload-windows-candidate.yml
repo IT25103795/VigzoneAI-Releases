@@ -1,0 +1,61 @@
+name: Upload verified Windows candidate
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+        type: string
+      artifact_url:
+        description: Short-lived download URL for the installer artifact only
+        required: true
+        type: string
+      sha256:
+        required: true
+        type: string
+      source_commit:
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      ARTIFACT_URL: ${{ inputs.artifact_url }}
+      EXPECTED_SHA256: ${{ inputs.sha256 }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download and verify installer-only artifact
+        shell: python
+        run: |
+          import hashlib, io, json, os, pathlib, re, urllib.parse, urllib.request, zipfile
+          version=os.environ['RELEASE_VERSION']
+          expected=os.environ['EXPECTED_SHA256'].lower()
+          commit=os.environ['SOURCE_COMMIT']
+          assert re.fullmatch(r'\d+\.\d+\.\d+',version)
+          assert re.fullmatch(r'[a-f0-9]{64}',expected)
+          assert re.fullmatch(r'[a-f0-9]{40}',commit)
+          url=os.environ['ARTIFACT_URL']; parsed=urllib.parse.urlsplit(url)
+          assert parsed.scheme=='https' and parsed.hostname.endswith(('.blob.core.windows.net','.actions.githubusercontent.com'))
+          with urllib.request.urlopen(url,timeout=180) as response: data=response.read(350*1024*1024+1)
+          assert len(data)<=350*1024*1024
+          name=f'Vigzone.AI-{version}.Setup.exe'
+          with zipfile.ZipFile(io.BytesIO(data)) as archive:
+              assert set(archive.namelist())=={name,'manifest.json'}
+              assert archive.getinfo(name).file_size<=300*1024*1024
+              manifest=json.loads(archive.read('manifest.json').decode('utf-8-sig'))
+              binary=archive.read(name)
+          assert manifest['source_commit']==commit and manifest['version']==version
+          assert manifest['sha256']==expected and manifest['size']==len(binary)
+          assert hashlib.sha256(binary).hexdigest()==expected and binary[:2]==b'MZ'
+          pathlib.Path(name).write_bytes(binary)
+          print('Verified installer bytes:',len(binary),'SHA256:',expected)
+      - name: Upload to the existing draft release
+        shell: bash
+        run: |
+          test "$(gh release view "v$RELEASE_VERSION" --json isDraft --jq .isDraft)" = true
+          gh release upload "v$RELEASE_VERSION" "Vigzone.AI-$RELEASE_VERSION.Setup.exe" --clobber
